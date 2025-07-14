@@ -1,40 +1,32 @@
 # main.py
 import os
-import uuid
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
-from dotenv import load_dotenv
-from contextlib import asynccontextmanager
+from langchain_groq import ChatGroq
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage # Use langchain_core.messages for clarity
 
-# Import Groq client
-from groq import Groq
+# Import functions and constants from your knowledge_base.py
+from knowledge_base import initialize_knowledge_base, load_vector_store, FAISS_INDEX_PATH
 
-# Import knowledge base functions
-from knowledge_base import (
-    add_document_to_knowledge_base,
-    get_document_content,
-    get_all_documents,
-    extract_text_from_pdf,
-    DOCUMENT_UPLOAD_DIR,
-    initialize_knowledge_base # Ensure this is called to create the directory
-)
-
-# Lifespan event to initialize the knowledge base
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    initialize_knowledge_base()
-    yield
+# Load environment variables
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is not set. Please add it to your .env file.")
 
 # Initialize FastAPI app
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(title="Doctor's AI Agent Backend")
 
-# Configure CORS to allow communication from your React frontend
+# Configure CORS for frontend communication
 origins = [
-    "http://localhost:3000", # React development server
-    "http://127.0.0.1:3000",
+    "http://localhost:5173", # For development frontend
+    "http://127.0.0.1:5173", # For development frontend
+    # Add other frontend origins if deployed
 ]
 
 app.add_middleware(
@@ -45,165 +37,129 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load Groq API key from environment variables
-from dotenv import load_dotenv
-load_dotenv()
+# Global variables for RAG components
+vector_store = None
+rag_chain = None
 
-grok_api_key = os.getenv("GROQ_API_KEY")
-if not grok_api_key:
-    raise ValueError("GROQ_API_KEY environment variable not set.")
-groq_client = Groq(api_key=grok_api_key)
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = "default_session" # Kept for potential future session management
 
-# Pydantic models for request and response bodies
-class QueryRequest(BaseModel):
-    document_id: str
-    query: str
+class ChatResponse(BaseModel):
+    response: str
+    context_sources: list[str] = []
 
-class DocumentInfo(BaseModel):
-    id: str
-    name: str
-
-class QueryResponse(BaseModel):
-    answer: str
-
-# Ensure the upload directory exists on startup
+@app.on_event("startup")
 async def startup_event():
+    """
+    Initializes the FAISS index (creating it if it doesn't exist)
+    and sets up the RAG chain when the FastAPI app starts.
+    """
+    global vector_store, rag_chain
+
+    print("Application starting up...")
+
+    # Step 1: Ensure the knowledge base (FAISS index) is ready
+    # This function will create the index if it doesn't exist or is empty
     initialize_knowledge_base()
-    # knowledge_base.load_documents_from_folder(knowledge_base.DOCUMENT_UPLOAD_DIR)
-    # The initialize_knowledge_base() function already calls load_documents_from_folder
-    # for the default DOCUMENT_UPLOAD_DIR.
 
-@app.get("/documents", response_model=List[DocumentInfo])
-async def get_documents():
+    # Step 2: Load the FAISS index for use in the application
+    try:
+        vector_store = load_vector_store(FAISS_INDEX_PATH)
+        print("FAISS index successfully loaded for application use.")
+    except Exception as e:
+        print(f"Error loading FAISS index: {e}")
+        raise RuntimeError("Failed to load FAISS index. Cannot start application without knowledge base.")
+
+    # Initialize Groq LLM
+    llm = ChatGroq(
+        api_key=GROQ_API_KEY,
+        model_name="llama3-8b-8192", # Using a smaller, faster model suitable for Q&A
+        temperature=0, # Set temperature to 0 for factual, less creative answers
+    )
+    print(f"Groq LLM initialized with model: {llm.model_name}")
+
+    # Define the prompt for the LLM
+    # This prompt instructs the LLM on how to use the retrieved context for doctors
+    prompt = ChatPromptTemplate.from_template("""
+    You are an AI assistant designed for healthcare professionals in Kenya. Your primary goal is to provide accurate and concise answers
+    to medical questions *strictly based on the provided local medical documents*.
+    
+    If the information required to answer the question is not explicitly present in the provided context,
+    state clearly, "I cannot find specific information on that in the provided documents." Do not invent information.
+    
+    Focus on being direct and factual. Avoid conversational filler.
+    
+    Context: {context}
+    
+    Question: {input}
+    """)
+
+    # Create a retriever from the vector store
+    # This will search the FAISS index for relevant chunks based on the query.
+    retriever = vector_store.as_retriever(search_kwargs={"k": 5}) # Retrieve 5 top relevant documents
+
+    # Create a document combining chain
+    # This chain takes the retrieved documents and the user's question and formats them for the LLM.
+    document_chain = create_stuff_documents_chain(llm, prompt)
+
+    # Create the full retrieval chain
+    # This chain orchestrates the retrieval of documents and then passes them to the LLM for generation.
+    rag_chain = create_retrieval_chain(retriever, document_chain)
+    print("RAG chain initialized successfully.")
+    print("Application startup complete. Ready to receive questions.")
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
     """
-    Returns a list of all available documents in the knowledge base.
+    Handles incoming chat messages from the frontend, performs RAG using FAISS and Groq,
+    and returns a structured response including the answer and source documents.
     """
-    docs = get_all_documents()
-    # Return as a list of document names (or objects if you want more info)
-    return docs
+    if rag_chain is None:
+        raise HTTPException(status_code=503, detail="AI agent not initialized. Please ensure the backend started correctly.")
 
-@app.post("/upload_documents")
-async def upload_documents(files: List[UploadFile] = File(...)):
-    """
-    Uploads one or more PDF documents, extracts text, and adds to the knowledge base.
-    """
-    uploaded_count = 0
-    for file in files:
-        if not file.filename.endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    user_message = request.message
+    print(f"Received question: {user_message}")
 
-        # Create a unique filename to avoid conflicts
-        file_extension = os.path.splitext(file.filename)[1]
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
-        file_path = os.path.join(DOCUMENT_UPLOAD_DIR, unique_filename)
+    try:
+        # Invoke the RAG chain with the user's question
+        # The chain will automatically handle retrieval and answer generation
+        response = await rag_chain.ainvoke({"input": user_message})
 
-        try:
-            # Save the uploaded file
-            with open(file_path, "wb") as buffer:
-                buffer.write(await file.read())
-
-            # Extract text and add to knowledge base
-            document_content = extract_text_from_pdf(file_path)
-            if document_content:
-                # Use the original filename as the document name, and a unique ID
-                add_document_to_knowledge_base(str(uuid.uuid4()), file.filename, document_content)
-                uploaded_count += 1
+        ai_response_content = response.get("answer", "I'm sorry, I couldn't process that request or find an answer in the provided documents.")
+        
+        # Extract sources from the retrieved documents
+        # The 'context' key in the response contains the list of Document objects
+        context_docs = response.get("context", [])
+        context_sources = []
+        for doc in context_docs:
+            source_path = doc.metadata.get('source', 'Unknown Source')
+            # Extract just the filename for cleaner display, if the source is a file path
+            if isinstance(source_path, str) and os.path.isfile(source_path):
+                context_sources.append(os.path.basename(source_path))
             else:
-                print(f"Warning: Could not extract text from uploaded file {file.filename}. It will not be available for querying.")
-                os.remove(file_path) # Remove empty file
-        except Exception as e:
-            print(f"Error processing uploaded file {file.filename}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to process file {file.filename}: {e}")
+                context_sources.append(source_path)
+        
+        # Deduplicate sources for a cleaner list
+        context_sources = list(set(context_sources))
 
-    return JSONResponse(content={"message": f"Successfully uploaded and processed {uploaded_count} document(s)."}, status_code=200)
+        print(f"Generated answer: {ai_response_content}")
+        print(f"Context sources: {context_sources}")
 
-@app.post("/query_ai")
-async def query_ai(request: QueryRequest):
-    """
-    Queries the AI about a specific document.
-    """
-    document_content = get_document_content(request.document_id)
+        return ChatResponse(response=ai_response_content, context_sources=context_sources)
 
-    if not document_content:
-        raise HTTPException(status_code=404, detail="Document not found or content is empty.")
-
-    # For simplicity, we'll send the entire document content to the LLM.
-    # For very large documents, implement RAG (Retrieval-Augmented Generation)
-    # to find relevant chunks of text.
-    # Truncate content if it's too long for the model's context window
-    max_content_length = 10000 # Adjust based on Groq model's context window
-    truncated_content = document_content[:max_content_length]
-
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content":"You are a helpful AI assistant specialized in healthcare. "
-                               "Answer questions using only the information provided in the document content. "
-                                "Rephrase your response in the same tone as the user's question. "
-                                "Keep the response concise and well-organized. "
-                                "Use the same words or phrases found in the document where appropriate. "
-                                "If the answer is not found in the document, say: 'The answer to your question "
-                                "is not found in the selected document.",
-                },
-                {
-                    "role": "user",
-                    "content": f"Document Content:\n{truncated_content}\n\nQuestion: {request.query}",
-                },
-            ],
-            model="llama3-8b-8192", 
-            temperature=0.7,
-            max_tokens=1024,
-            top_p=1,
-            stream=False,
-            stop=None,
-        )
-        ai_response = chat_completion.choices[0].message.content
-        return {"response": ai_response}
     except Exception as e:
-        print(f"Error calling Groq API: {e}")
-        raise HTTPException(status_code=500, detail=f"Error communicating with AI: {e}")
+        print(f"Error processing chat message: {e}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred while processing your request. Please try again.")
 
-@app.post("/query", response_model=QueryResponse)
-async def query_document(request: QueryRequest):
-    """
-    Queries the document and returns the answer using the AI model.
-    """
-    document_content = get_document_content(request.document_id)
+# Basic GET endpoint for health check or initial browser access
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "message": "AI Agent is running and healthy."}
 
-    if not document_content:
-        raise HTTPException(status_code=404, detail="Document not found or content is empty.")
-
-    # Truncate content if it's too long for the model's context window
-    max_content_length = 10000  # Adjust based on Groq model's context window
-    truncated_content = document_content[:max_content_length]
-
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful AI assistant specialized in healthcare."
-                    "Respond to salutations and enquire on how you may be of help."
-                    " Answer questions based on the provided document content. If the answer"
-                    "is not in the document, indicate the question asked is not in the document selected.",
-                },
-                {
-                    "role": "user",
-                    "content": f"Document Content:\n{truncated_content}\n\nQuestion: {request.query}",
-                },
-            ],
-            model="llama3-8b-8192",
-            temperature=0.7,
-            max_tokens=1024,
-            top_p=1,
-            stream=False,
-            stop=None,
-        )
-        ai_response = chat_completion.choices[0].message.content
-        return {"answer": ai_response}
-    except Exception as e:
-        print(f"Error calling Groq API: {e}")
-        raise HTTPException(status_code=500, detail=f"Error communicating with AI: {e}")
-
+if __name__ == "__main__":
+    import uvicorn
+    # Make sure to run this from the directory where main.py, knowledge_base.py,
+    # and the pdfs/ folder are located.
+    uvicorn.run(app, host="127.0.0.1", port=8000)

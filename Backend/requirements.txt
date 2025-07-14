@@ -1,7 +1,14 @@
-# requirements.txt
-fastapi==0.111.0
-uvicorn==0.30.1
-python-multipart==0.0.9 # For handling file uploads
-PyPDF2==3.0.1 # For PDF text extraction
-groq==0.8.0 # Groq API client
-python-dotenv==1.0.1 # Optional, for loading environment variables (e.g., GROQ_API_KEY)
+fastapi
+uvicorn[standard]
+langchain
+langchain-community
+langchain-openai
+langchain_groq
+faiss-cpu # Or faiss-gpu if you have a compatible GPU
+python-dotenv
+tiktoken # For token counting in LangChain
+# Additional dependencies for the mental health model
+pydantic
+scikit-learn
+numpy
+pandas
