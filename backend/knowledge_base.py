@@ -12,7 +12,7 @@ import os
 # Load environment variables
 load_dotenv()
 
-PDFS_FOLDER = "backend\pdfs"
+PDFS_FOLDER = "pdfs"
 FAISS_INDEX_PATH = "faiss_index"
 
 def create_and_save_vector_store(pdfs_folder: str = PDFS_FOLDER, index_path: str = FAISS_INDEX_PATH):
